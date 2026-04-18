@@ -1,421 +1,523 @@
-# Dementia Patient Monitoring System — Software Documentation
+# Sally — Personal Wearable AI Assistant
+
+<table border="0">
+<tr>
+<td width="50%" align="center">
+<img src="assets/images/sally_logo.svg" width="45%" alt="Sally Logo">
+</td>
+<td width="50%" align="center">
+<img src="assets/images/RiceStackedHoriz_Blue.png" width="45%" alt="Rice University">
+</td>
+</tr>
+</table>
+
+> **Always-on ambient intelligence.** Sally is a wearable AI assistant built on a Raspberry Pi 4 + ESP32 that continuously listens, transcribes, summarizes, and extracts actionable intent from your spoken day — surfacing everything through an encrypted backend and a native Flutter mobile app.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Feature Highlights](#feature-highlights)
+- [Tech Stack](#tech-stack)
+- [Repository Layout](#repository-layout)
+- [Data Flow](#data-flow)
+- [API Reference](#api-reference)
+- [Database Schema](#database-schema)
+- [Flutter Mobile App](#flutter-mobile-app)
+- [Deployment](#deployment)
+- [Security Model](#security-model)
+- [Performance](#performance)
+- [Getting Started](#getting-started)
+- [Team](#team)
+
+---
 
 ## Overview
 
-An edge AI pipeline running on a Raspberry Pi 4 that continuously processes audio from an ESP32 wearable device. The system transcribes speech, analyses it for patient safety and intent, encrypts all data at rest, and stores everything in a PostgreSQL database.
+Sally captures ambient audio through an ESP32 microphone worn on the body, streams it over Wi-Fi to a Raspberry Pi 4 edge server, and runs a multi-stage AI pipeline:
+
+1. **Voice Diarization** — MFCC-based fingerprinting isolates the owner's voice from background speakers before any transcription occurs.
+2. **Speech-to-Text** — Groq Cloud `whisper-large-v3` produces low-latency transcripts.
+3. **LLM Summarization & Intent Extraction** — `llama-3.3-70b-versatile` extracts structured summaries and intent signals (tasks, decisions, emotional cues) with fused-confidence scoring.
+4. **RAG Memory** — `pgvector` embeds transcript chunks for semantic recall across sessions.
+5. **Encrypted Storage** — Every file written to disk (audio, transcripts, summaries) is Fernet-encrypted (AES-128-CBC + HMAC-SHA256) at rest.
+6. **Mobile Dashboard** — A Flutter app connects over Tailscale VPN to browse window summaries, manage reminders, and chat with Sally using retrieved memory context.
 
 ---
 
-## System Architecture
+## Architecture
 
 ```
-ESP32 Wearable (microphone)
-        ↓ HTTP POST (audio file)
-Flask Server (server.py)
-        ↓
-[Step 1]  FFmpeg — convert AAC/MP3 → 16kHz mono WAV
-        ↓
-[Step 2]  WebRTC VAD — skip silent recordings
-        ↓
-[Step 3]  Moonshine ONNX — speech-to-text transcription (chunked, 25s windows)
-        ↓
-[Step 4]  Fernet encryption — encrypt transcript + audio files at rest
-        ↓
-[Step 5]  Keyword check — fast pre-screen for danger/forgetting keywords
-        ↓
-[Step 6]  Groq LLM (llama-3.3-70b) — multi-speaker aware summary + alert detection
-        ↓
-[Step 7]  Intent extraction + Confidence Fusion Layer + Decision Engine
-        ↓
-[Step 8]  Encrypt summary JSON
-        ↓
-[Step 9]  PostgreSQL — store all file paths, statuses, intents, reminders
-```
-
----
-
-## Requirements
-
-### Hardware
-- Raspberry Pi 4 (4GB RAM minimum)
-- ESP32 wearable with microphone
-
-### Software
-- Python 3.13
-- PostgreSQL 17
-- FFmpeg
-- Ollama (optional — for local LLM testing)
-
-### Python packages
-```bash
-pip3 install flask werkzeug psycopg2-binary numpy \
-             moonshine-onnx groq cryptography \
-             webrtcvad-wheels soundfile
-```
-
----
-
-## Installation
-
-### 1. Clone and set up virtual environment
-```bash
-python3 -m venv /home/osugiw/stt_env
-source /home/osugiw/stt_env/bin/activate
-pip3 install flask werkzeug psycopg2-binary numpy \
-             moonshine-onnx groq cryptography \
-             webrtcvad-wheels soundfile
-```
-
-### 2. Install system dependencies
-```bash
-sudo apt update
-sudo apt install postgresql postgresql-contrib ffmpeg -y
-```
-
-### 3. Set up PostgreSQL database
-```bash
-sudo -u postgres psql -c "CREATE USER jeeven WITH PASSWORD '12345';"
-sudo -u postgres psql -c "CREATE DATABASE stt_db OWNER jeeven;"
-```
-
-Create tables:
-```bash
-sudo -u postgres psql -d stt_db -c "
-CREATE TABLE recordings (
-    id          SERIAL PRIMARY KEY,
-    audio_file  TEXT NOT NULL,
-    status      TEXT DEFAULT 'uploaded',
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE transcripts (
-    id            SERIAL PRIMARY KEY,
-    recording_id  INTEGER REFERENCES recordings(id) ON DELETE CASCADE,
-    text          TEXT
-);
-
-CREATE TABLE summaries (
-    id            SERIAL PRIMARY KEY,
-    recording_id  INTEGER REFERENCES recordings(id) ON DELETE CASCADE,
-    summary       TEXT
-);
-
-CREATE TABLE intents (
-    id               SERIAL PRIMARY KEY,
-    recording_id     INTEGER REFERENCES recordings(id) ON DELETE CASCADE,
-    task             TEXT NOT NULL,
-    temporal_cue     TEXT,
-    raw_quote        TEXT,
-    semantic_score   REAL,
-    temporal_score   REAL,
-    cognitive_score  REAL,
-    fused_confidence REAL,
-    decision         TEXT,
-    action           TEXT,
-    cognitive_signals TEXT,
-    status           TEXT DEFAULT 'pending',
-    reminder_sent    BOOLEAN DEFAULT FALSE,
-    scheduled_time   TIMESTAMP,
-    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE intent_feedback (
-    id         SERIAL PRIMARY KEY,
-    intent_id  INTEGER REFERENCES intents(id) ON DELETE CASCADE,
-    outcome    TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO jeeven;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO jeeven;
-"
-```
-
-### 4. Set up folder structure
-```bash
-mkdir -p /home/osugiw/mcu_server/uploads
-mkdir -p /home/osugiw/mcu_server/transcripts
-mkdir -p /home/osugiw/mcu_server/summaries
-mkdir -p /home/osugiw/backup
-```
-
-### 5. Configure API key
-Edit `server.py` and set your Groq API key:
-```python
-GROQ_API_KEY = "your_groq_api_key_here"
-```
-Get a free key at: https://console.groq.com
-
-### 6. Run the server
-```bash
-source /home/osugiw/stt_env/bin/activate
-python3 /home/osugiw/mcu_server/server.py
-```
-
-### 7. Back up the encryption key
-The encryption key is auto-generated on first run. Back it up immediately:
-```bash
-cp /home/osugiw/mcu_server/.encryption_key /home/osugiw/backup/.encryption_key
-```
-> ⚠️ **CRITICAL: Losing this key means losing access to all patient data permanently.**
-
----
-
-## Folder Structure
-
-```
-/home/osugiw/mcu_server/
-├── server.py                  # Main Flask application
-├── .encryption_key            # Fernet encryption key (keep private)
-├── uploads/                   # Incoming audio files (encrypted after processing)
-│   └── 2026-03-27_172001.wav.enc
-├── transcripts/               # Encrypted transcript files
-│   └── 2026-03-27_172001.txt.enc
-└── summaries/                 # Encrypted summary JSON files
-    └── 2026-03-27_172001_summary.json.enc
-
-/home/osugiw/backup/
-└── .encryption_key            # Backup of encryption key
+┌────────────────────────────────────────────────────────────────────────┐
+│                          Wearable Hardware                             │
+│  ┌──────────────┐   AAC audio   ┌─────────────────────────────────┐   │
+│  │  ESP32-S3    │ ────────────► │         Raspberry Pi 4          │   │
+│  │  MEMS mic    │   HTTP POST   │         (Edge Server)           │   │
+│  └──────────────┘               │                                 │   │
+│                                 │  ┌──────────────────────────┐   │   │
+│                                 │  │   server_personal.py     │   │   │
+│                                 │  │   (Flask  +  pipeline)   │   │   │
+│                                 │  └────────────┬─────────────┘   │   │
+│                                 │               │                 │   │
+│                                 │   ┌───────────▼──────────────┐  │   │
+│                                 │   │  Voice Diarization       │  │   │
+│                                 │   │  WebRTC VAD + MFCC (120d)│  │   │
+│                                 │   └───────────┬──────────────┘  │   │
+│                                 │               │ owner segments  │   │
+│                                 │   ┌───────────▼──────────────┐  │   │
+│                                 │   │  Groq Whisper STT        │  │   │
+│                                 │   │  whisper-large-v3        │  │   │
+│                                 │   └───────────┬──────────────┘  │   │
+│                                 │               │ transcript      │   │
+│                                 │   ┌───────────▼──────────────┐  │   │
+│                                 │   │  Groq LLM                │  │   │
+│                                 │   │  llama-3.3-70b-versatile │  │   │
+│                                 │   │  Summary + Intent        │  │   │
+│                                 │   └───────────┬──────────────┘  │   │
+│                                 │               │                 │   │
+│                                 │   ┌───────────▼──────────────┐  │   │
+│                                 │   │  PostgreSQL + pgvector   │  │   │
+│                                 │   │  Fernet-encrypted files  │  │   │
+│                                 │   └──────────────────────────┘  │   │
+│                                 └─────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────┘
+                                        │  Tailscale VPN
+                                        ▼
+                               ┌─────────────────┐
+                               │  Flutter App    │
+                               │  iOS / Android  │
+                               │  Summary · Chat │
+                               │  Reminders      │
+                               └─────────────────┘
 ```
 
 ---
 
-## API Endpoints
+## Feature Highlights
 
-### Upload audio
+| Feature | Detail |
+|---|---|
+| **Owner-only transcription** | WebRTC VAD segments audio; per-segment MFCC cosine similarity filters out non-owner speech before any API call |
+| **Voice enrollment** | One-shot enrollment via `/enroll` — 120-dim MFCC mean stored in `voice_profiles` table, persists across restarts |
+| **Window summaries** | Aggregated views for Last 6 Hours, Today (since midnight UTC), and rolling 24 h via `/summary/window` |
+| **Intent extraction** | Fused-confidence scoring (semantic 70 % · temporal 15 % · cognitive 15 %) classifies intent as `act / confirm / log / ignore` |
+| **RAG memory** | `pgvector` nearest-neighbor search feeds relevant transcript chunks into Sally Q&A responses |
+| **Reminders CRUD** | Full lifecycle: create, snooze, resolve — with optional `repeat_rule` and `scheduled_time` |
+| **Encrypted at rest** | Fernet (AES-128-CBC + HMAC-SHA256) on every audio file, transcript, and summary |
+| **Bearer token auth** | SHA-256 hashed tokens in `api_tokens` table; `last_used` timestamp updated on every request |
+| **Scheduler daemon** | `scheduler.py` polls for pending intents and fires reminders on schedule |
+| **Cross-platform Flutter** | Single codebase for iOS + Android; compile-time config via `--dart-define` |
+| **GitHub Actions iOS build** | Unsigned IPA built on macOS runner, sideloadable via Sideloadly |
+
+---
+
+## Tech Stack
+
+### Edge Server (Raspberry Pi 4)
+| Layer | Technology |
+|---|---|
+| Runtime | Python 3.11 |
+| HTTP Framework | Flask |
+| Speech-to-Text | Groq Cloud — `whisper-large-v3` |
+| LLM | Groq Cloud — `llama-3.3-70b-versatile` |
+| Voice Diarization | WebRTC VAD + NumPy MFCC (no PyTorch) |
+| Database | PostgreSQL 15 + `pgvector` extension |
+| Encryption | `cryptography` — Fernet |
+| Audio conversion | FFmpeg (AAC → WAV) |
+| Scheduling | `schedule` library (APScheduler-style loop) |
+
+### Mobile App (Flutter)
+| Layer | Technology |
+|---|---|
+| Framework | Flutter 3.41.7 / Dart 3.x |
+| HTTP client | `package:http` |
+| Storage | `shared_preferences` |
+| Config injection | `--dart-define` at build time |
+| Connectivity | Tailscale VPN (private IP routing) |
+
+### Infrastructure
+| Component | Technology |
+|---|---|
+| Network | Tailscale mesh VPN |
+| CI/CD | GitHub Actions (iOS IPA build) |
+| Hardware | Raspberry Pi 4 (4 GB RAM) + ESP32-S3 |
+
+---
+
+## Repository Layout
+
 ```
-POST /upload
+.
+├── server_personal.py        # Flask API + full AI pipeline
+├── config.py                 # Environment-variable configuration
+├── scheduler.py              # Background reminder/intent scheduler
+├── schema.sql                # PostgreSQL DDL (idempotent, safe to re-run)
+├── cleanup.py                # Utility: purge old encrypted files
+├── mobile_intents_client.py  # CLI helper: list/update intents from terminal
+│
+├── lib/                      # Flutter source
+│   ├── main.dart             # App entry — 5-tab navigation
+│   ├── app_config.dart       # Compile-time --dart-define reader
+│   ├── sally_api.dart        # Typed API client (all endpoints)
+│   ├── login_page.dart       # Token-based authentication screen
+│   ├── chat_page.dart        # Transcript browser + Sally Q&A
+│   ├── summary_page.dart     # Per-recording detail view
+│   ├── summary_dashboard_page.dart  # Window summaries + Reminders tabs
+│   ├── device_page.dart      # Device status and settings
+│   ├── profile_page.dart     # User profile
+│   ├── intent_record.dart    # Intent data model
+│   └── widgets/
+│       ├── sally_nav_bar.dart # Animated 5-item bottom nav
+│       ├── sally_button.dart  # Branded primary button
+│       ├── sally_logo.dart    # SVG logo component
+│       ├── home_card.dart     # Metric card widget
+│       └── nav_item.dart      # Nav bar item
+│
+├── assets/images/            # SVG/PNG branding assets
+│
+├── .github/workflows/
+│   └── build-ios.yml         # GitHub Actions: unsigned IPA build
+│
+└── schema.sql                # Database schema + migrations
+```
+
+---
+
+## Data Flow
+
+```
+ESP32 records N seconds of AAC
+        │
+        ▼
+POST /upload  (multipart, Bearer token)
+        │
+        ▼
+[1] ffmpeg: AAC → 16 kHz mono WAV
+        │
+        ▼
+[2] WebRTC VAD → speech segments
+    Per segment: MFCC (120-dim) → cosine similarity vs enrolled profile
+    Owner segments concatenated → filtered WAV
+    (non-owner audio discarded; recording marked "no_owner_speech" and skipped)
+        │
+        ▼
+[3] Groq Whisper STT → plain-text transcript
+    Transcript Fernet-encrypted → .txt.enc written to disk
+    Path stored in transcripts table
+        │
+        ▼
+[4] Groq LLM → structured JSON
+    {summary, topics, intent_signals, cognitive_flags, action_items}
+    JSON Fernet-encrypted → _summary.json.enc written to disk
+    Path stored in summaries table
+        │
+        ▼
+[5] Intent extraction
+    Each intent_signal scored (semantic · temporal · cognitive)
+    Fused confidence → decision (act/confirm/log/ignore)
+    Stored in intents table with scheduled_time if temporal cue detected
+        │
+        ▼
+[6] RAG chunking
+    Transcript split into ~200-token chunks
+    all-MiniLM-L6-v2 embedding (384-dim) stored in memory_chunks (pgvector)
+        │
+        ▼
+Recording marked "processed"
+```
+
+---
+
+## API Reference
+
+All endpoints (except `/health` and `/admin/tokens`) require:
+```
+Authorization: Bearer <token>
+```
+
+### Core
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness check — returns `{"status":"ok"}` |
+| `POST` | `/upload` | Upload AAC audio file; triggers async pipeline |
+| `GET` | `/recordings` | List recordings for a device |
+| `GET` | `/transcript/<id>` | Fetch decrypted transcript text |
+| `GET` | `/summary/<id>` | Fetch decrypted summary JSON |
+
+### Query Parameters
+`device_id` is required on all data endpoints:
+```
+GET /recordings?device_id=esp32_01&limit=20
+```
+
+### Window Summaries
+
+```
+GET /summary/window?device_id=esp32_01&window=6h
+GET /summary/window?device_id=esp32_01&window=day
+GET /summary/window?device_id=esp32_01&window=24h
+```
+
+**Response:**
+```json
+{
+  "window": "6h",
+  "start": "2026-04-18T06:00:00Z",
+  "end":   "2026-04-18T12:00:00Z",
+  "recording_count": 14,
+  "summary": "...",
+  "topics": ["project planning", "lunch", "..."],
+  "action_items": ["..."]
+}
+```
+
+### Intents
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/intents` | List intents (`?device_id=&status=pending`) |
+| `PATCH` | `/intents/<id>` | Update status (`completed` / `ignored`) |
+
+### Reminders
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/reminders` | List reminders (`?device_id=&status=pending`) |
+| `POST` | `/reminders` | Create reminder |
+| `PATCH` | `/reminders/<id>` | Update (snooze, resolve, edit) |
+| `DELETE` | `/reminders/<id>` | Delete reminder |
+
+**Create reminder body:**
+```json
+{
+  "device_id": "esp32_01",
+  "title": "Call doctor",
+  "notes": "Re: blood test results",
+  "scheduled_time": "2026-04-19T09:00:00Z",
+  "repeat_rule": "none"
+}
+```
+
+### Sally Q&A (RAG)
+
+```
+POST /ask
+{
+  "device_id": "esp32_01",
+  "question": "What did I decide about the project proposal?"
+}
+```
+
+Uses `pgvector` nearest-neighbor search over `memory_chunks` to ground the LLM response in your actual transcripts.
+
+### Voice Enrollment
+
+```
+POST /enroll
 Content-Type: multipart/form-data
-Body: file=<audio_file>
-```
-```bash
-curl -X POST -F "file=@/path/to/audio.aac" http://localhost:5000/upload
-```
-
-### Check pipeline status
-```
-GET /status/<filename>
-```
-```bash
-curl http://localhost:5000/status/2026-03-27_172001.aac
+  file=<16kHz mono WAV>
+  device_id=esp32_01
+  label=owner
 ```
 
-### List all recordings
+Computes 120-dim MFCC mean embedding from the WAV and persists it to `voice_profiles`. Enrollment survives server restarts — re-enrollment required only if the profile needs updating.
+
+### Admin (localhost only)
+
 ```
-GET /recordings
-```
-```bash
-curl http://localhost:5000/recordings
+POST /admin/tokens          # Create new API token
+  { "device_id": "esp32_01", "label": "phone" }
 ```
 
-### Get alert-flagged recordings
-```
-GET /alerts
-```
-```bash
-curl http://localhost:5000/alerts
-```
-
-### Decrypt and read a transcript
-```
-GET /decrypt/transcript/<recording_id>
-```
-```bash
-curl http://localhost:5000/decrypt/transcript/51
-```
-
-### Decrypt and read a summary
-```
-GET /decrypt/summary/<recording_id>
-```
-```bash
-curl http://localhost:5000/decrypt/summary/51
-```
-
-### Get all intents
-```
-GET /intents
-```
-```bash
-curl http://localhost:5000/intents
-```
-
-### Get intents for a specific recording
-```
-GET /intents/<recording_id>
-```
-```bash
-curl http://localhost:5000/intents/51
-```
-
-### Get pending reminders (for caregiver app to poll)
-```
-GET /reminders/pending
-```
-```bash
-curl http://localhost:5000/reminders/pending
-```
-
-### Mark reminder as sent
-```
-POST /reminders/<intent_id>/sent
-```
-```bash
-curl -X POST http://localhost:5000/reminders/1/sent
-```
-
-### Submit caregiver feedback on intent (learning loop)
-```
-POST /intents/<intent_id>/feedback
-Body: {"outcome": "accepted"} | {"outcome": "rejected"} | {"outcome": "ignored"}
-```
-```bash
-curl -X POST http://localhost:5000/intents/1/feedback \
-     -H "Content-Type: application/json" \
-     -d '{"outcome": "accepted"}'
-```
-
-### View learning loop statistics
-```
-GET /learning/stats
-```
-```bash
-curl http://localhost:5000/learning/stats
-```
+Returns the raw token once — store it securely.
 
 ---
 
-## Pipeline Status Values
+## Database Schema
 
-| Status | Meaning |
+Sally uses PostgreSQL 15 with the `pgvector` extension. `schema.sql` is fully idempotent (`IF NOT EXISTS` + `ALTER TABLE … ADD COLUMN IF NOT EXISTS`) and safe to re-run on an existing database.
+
+### Tables
+
+| Table | Purpose |
 |---|---|
-| `uploaded` | File received, pipeline starting |
-| `no_speech` | VAD detected no speech — skipped |
-| `transcribed` | Moonshine transcription complete |
-| `transcription_failed` | Transcription returned empty |
-| `completed` | Full pipeline done, no alerts |
-| `alert_flagged` | Danger or forgetting detected |
-| `intent_flagged` | High-confidence patient intent detected |
-| `error` | Pipeline error |
+| `recordings` | Tracks every uploaded audio file and its pipeline status |
+| `transcripts` | Stores encrypted file path for each transcript |
+| `summaries` | Stores encrypted file path for each LLM summary |
+| `intents` | Intent records with fused confidence scores and scheduling |
+| `voice_profiles` | One row per device — MFCC enrollment embedding |
+| `memory_chunks` | `vector(384)` embeddings for RAG retrieval |
+| `sally_queries` | Q&A history with source chunk references |
+| `hourly_summaries` | Pre-aggregated hourly summaries (cache) |
+| `window_summaries` | 6h / day / 24h window summaries |
+| `reminders` | User-managed reminders with repeat rules |
+| `api_tokens` | SHA-256 hashed Bearer tokens |
 
 ---
 
-## Intent Decision Engine
+## Flutter Mobile App
 
-Intents are scored using three signals combined into a fused confidence score:
+### Navigation (5 tabs)
 
-| Signal | Weight | Description |
+| Tab | Page | Description |
 |---|---|---|
-| Semantic score | 50% | How clearly is this a genuine intent (from LLM) |
-| Temporal score | 25% | Presence and specificity of time cues |
-| Cognitive score | 25% | Reduced when hesitation/filler words are high |
+| 0 | Home | Recent recordings and quick stats |
+| 1 | Device | Device status and configuration |
+| 2 | Chat | Transcript browser + Sally Q&A |
+| 3 | Summary | Window summaries (6h / Today) + Reminders |
+| 4 | Profile | User settings |
 
-### Decision thresholds
+### Compile-time Configuration
 
-| Fused score | Decision | Action |
-|---|---|---|
-| ≥ 0.75 | `act` | Notify caregiver immediately |
-| ≥ 0.50 | `confirm` | Caregiver to confirm with patient |
-| ≥ 0.30 | `log` | Log quietly, no disturbance |
-| < 0.30 | `ignore` | Too uncertain |
+The app receives all sensitive config at build time via `--dart-define` — no secrets in source:
 
-### Reminder scheduling
+```bash
+flutter build apk \
+  --dart-define=SALLY_API_BASE_URL=http://100.x.x.x:5000 \
+  --dart-define=SALLY_API_TOKEN=<bearer-token> \
+  --dart-define=SALLY_DEVICE_ID=esp32_01
+```
 
-When an intent is detected with a temporal cue, two reminders are stored:
-- **Immediate** — appears in `/reminders/pending` right away (caregiver knows intent was heard)
-- **Scheduled** — appears in `/reminders/pending` when the stated time arrives
+`app_config.dart` reads these with `String.fromEnvironment(...)`.
 
-Temporal cue parsing examples:
+---
 
-| Patient says | Scheduled time |
+## Deployment
+
+### Prerequisites
+
+- Raspberry Pi 4 (4 GB RAM recommended) running Raspberry Pi OS (64-bit)
+- PostgreSQL 15 + `pgvector` extension
+- Python 3.11 + pip
+- FFmpeg
+- Groq API key
+- Tailscale installed on both Pi and phone
+
+### Pi Server Setup
+
+```bash
+# 1. Clone repo
+git clone https://github.com/<org>/sally-wearable.git
+cd sally-wearable
+
+# 2. Install Python dependencies
+pip install -r requirements.txt
+
+# 3. Configure environment
+cp .env.example .env
+# edit .env — set GROQ_API_KEY, DB_*, folder paths
+
+# 4. Initialise database (safe to re-run)
+psql -h localhost -U <db_user> -d <db_name> -f schema.sql
+
+# 5. Enroll your voice (once)
+curl -X POST http://localhost:5000/enroll \
+  -H "Authorization: Bearer <token>" \
+  -F "file=@/path/to/voice_sample.wav" \
+  -F "device_id=esp32_01"
+
+# 6. Start server
+python server_personal.py
+
+# 7. (Optional) Start scheduler
+python scheduler.py
+```
+
+### iOS IPA via GitHub Actions
+
+1. Go to **Actions → Build iOS IPA → Run workflow**
+2. Supply the Pi's Tailscale IP and your device ID
+3. Set `SALLY_API_TOKEN` in **Settings → Secrets**
+4. Download the artifact and sideload with [Sideloadly](https://sideloadly.io/)
+
+### Android APK
+
+```bash
+flutter build apk \
+  --dart-define=SALLY_API_BASE_URL=http://100.x.x.x:5000 \
+  --dart-define=SALLY_API_TOKEN=<token> \
+  --dart-define=SALLY_DEVICE_ID=esp32_01
+# Output: build/app/outputs/flutter-apk/app-release.apk
+```
+
+---
+
+## Security Model
+
+| Threat | Mitigation |
 |---|---|
-| "tonight" | Today at 7:00 PM |
-| "tomorrow" | Tomorrow at 9:00 AM |
-| "this afternoon" | Today at 2:00 PM |
-| "at 5" | Today at 5:00 PM |
-| "later" | 2 hours from now |
+| Network interception | All traffic routed over Tailscale WireGuard VPN (zero exposed ports) |
+| Stolen device / disk | Fernet encryption on every file written to disk; key stored separately |
+| Unauthorized API access | Bearer token required on all data endpoints; SHA-256 hash stored (never plaintext) |
+| Third-party speech | MFCC voice diarization discards non-owner segments before transcription |
+| Token leakage | Tokens issued once at creation; `last_used` auditing; localhost-only issuance |
 
 ---
 
-## Encryption
+## Performance
 
-All patient data is encrypted at rest using **Fernet symmetric encryption** (AES-128-CBC + HMAC-SHA256).
+Measured on Raspberry Pi 4 (4 GB) with a 60-second AAC recording:
 
-- Audio files: encrypted to `.wav.enc`
-- Transcripts: encrypted to `.txt.enc`
-- Summaries: encrypted to `.json.enc`
-- Encryption key stored at `/home/osugiw/mcu_server/.encryption_key`
+| Stage | Typical Latency |
+|---|---|
+| AAC → WAV conversion (FFmpeg) | ~0.3 s |
+| Voice diarization (VAD + MFCC) | ~0.8 s |
+| Groq Whisper STT | ~1.5 s |
+| Groq LLM summary + intent | ~2.5 s |
+| pgvector embedding + insert | ~0.4 s |
+| **Total pipeline (p50)** | **~5.5 s** |
 
-To read any encrypted file via the API:
+Voice diarization runs entirely on-device with pure NumPy/SciPy — no GPU or cloud dependency.
+
+---
+
+## Getting Started
+
+### Local Development (Flutter)
+
 ```bash
-curl http://localhost:5000/decrypt/transcript/<recording_id>
-curl http://localhost:5000/decrypt/summary/<recording_id>
+git clone https://github.com/<org>/sally-wearable.git
+cd sally-wearable
+flutter pub get
+
+# Run on connected device or emulator
+flutter run \
+  --dart-define=SALLY_API_BASE_URL=http://100.x.x.x:5000 \
+  --dart-define=SALLY_API_TOKEN=<token> \
+  --dart-define=SALLY_DEVICE_ID=esp32_01
+```
+
+### Environment Variables (`.env` on Pi)
+
+```
+GROQ_API_KEY=gsk_...
+DB_HOST=localhost
+DB_NAME=stt_db
+DB_USER=jeeven
+DB_PASSWORD=...
+AUDIO_FOLDER=/home/osugiw/mcu_server/uploads
+TRANSCRIPT_FOLDER=/home/osugiw/mcu_server/transcripts
+SUMMARY_FOLDER=/home/osugiw/mcu_server/summaries
+ENROLL_FOLDER=/home/osugiw/mcu_server/enrollments
+KEY_FILE=/home/osugiw/mcu_server/.fernet_key
 ```
 
 ---
 
-## Models Used
+## Team
 
-| Component | Model | Where it runs |
+| Name | Role | Contact |
 |---|---|---|
-| Speech-to-text | Moonshine ONNX base (~74MB) | Local on Pi |
-| LLM summary + alerts | llama-3.3-70b-versatile | Groq API (free) |
-| Intent extraction | llama-3.3-70b-versatile | Groq API (free) |
-| Voice Activity Detection | WebRTC VAD | Local on Pi |
+| **Jeeven Balasubramaniam** | Backend · AI Pipeline · Mobile | [jb310@rice.edu](mailto:jb310@rice.edu) |
+| **Sugiarto Wibowo** | Hardware · Firmware · Infrastructure | [sw183@rice.edu](mailto:sw183@rice.edu) |
+
+**Supervisor:** Nakul Garg — Rice University, ECE Department
 
 ---
 
-## Running as a System Service
-
-To run the server automatically on boot:
-
-```bash
-sudo nano /etc/systemd/system/mcu_server.service
-```
-
-```ini
-[Unit]
-Description=MCU Flask Server
-After=network.target postgresql.service
-
-[Service]
-User=osugiw
-WorkingDirectory=/home/osugiw/mcu_server
-Environment="PATH=/home/osugiw/stt_env/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/home/osugiw/stt_env/bin/python3 /home/osugiw/mcu_server/server.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable mcu_server
-sudo systemctl start mcu_server
-```
-
----
-
-## Database Access via DBeaver
-
-Connect DBeaver on your laptop to the Pi database using Tailscale:
-
-- **Host:** `100.120.159.54` (Tailscale IP)
-- **Port:** `5432`
-- **Database:** `stt_db`
-- **Username:** `jeeven`
-- **Password:** `12345`
-
----
-
-## Future Roadmap
-
-- [ ] Caregiver mobile app (React Native) with push notifications via Ntfy
-- [ ] HTTPS/SSL for encrypted data in transit
-- [ ] Upgrade to Pi 5 with llama3.2:3b for better local LLM quality
-- [ ] Speaker diarization to better isolate patient voice
-- [ ] Throat microphone hardware for single-speaker isolation
-- [ ] Personalised threshold adjustment via learning loop data
-- [ ] Daily report generation for medical records
+<div align="center">
+  <sub>Built at Rice University · Houston, Texas</sub>
+</div>
